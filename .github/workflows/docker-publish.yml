@@ -126,7 +126,7 @@ jobs:
             tag_suffix: "-templates"
             description: Notploy templates gallery
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # cosign (keyless signing) needs the full tag history to resolve the
           # commit that an image was built from.
@@ -296,7 +296,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

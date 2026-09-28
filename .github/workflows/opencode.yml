@@ -51,7 +51,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # The agent works on the checked-out tree only; do not leave a token in
           # .git/config.
