@@ -1,7 +1,6 @@
 name: Notploy Deployment
 description: >-
-  Trigger a Notploy deployment from a GitHub Actions workflow and, optionally,
-  wait for it to finish and fail the job when the deployment fails.
+  Trigger a Notploy deployment from GitHub Actions and optionally wait for it to finish.
 author: Sky Genesis Enterprise
 
 branding:
