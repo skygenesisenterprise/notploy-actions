@@ -98,7 +98,7 @@ jobs:
 
       - name: Deploy to Notploy
         id: deploy
-        uses: skygenesisenterprise/notploy/packages/actions@master
+        uses: skygenesisenterprise/notploy-actions@v1
         with:
           endpoint: ${{ secrets.NOTPLOY_URL }}
           api-key: ${{ secrets.NOTPLOY_API_KEY }}
@@ -112,7 +112,7 @@ jobs:
 ```yaml
       - name: Deploy to Notploy
         id: notploy
-        uses: skygenesisenterprise/notploy/packages/actions@master
+        uses: skygenesisenterprise/notploy-actions@v1
         with:
           endpoint: ${{ secrets.NOTPLOY_URL }}
           api-key: ${{ secrets.NOTPLOY_API_KEY }}
@@ -169,7 +169,7 @@ jobs:
 
       - name: Deploy to Notploy
         id: notploy
-        uses: skygenesisenterprise/notploy/packages/actions@master
+        uses: skygenesisenterprise/notploy-actions@v1
         with:
           endpoint: ${{ secrets.NOTPLOY_URL }}
           api-key: ${{ secrets.NOTPLOY_API_KEY }}
@@ -295,15 +295,12 @@ uses: skygenesisenterprise/notploy-actions@v1     # moving major tag
 uses: skygenesisenterprise/notploy-actions@v1.2.0 # exact release
 ```
 
-Today, from this monorepo, it is referenced by path instead:
-
-```yaml
-uses: skygenesisenterprise/notploy/packages/actions@master
-```
+This repository is already the dedicated repository, so the action is always
+referenced by that endpoint — never by a monorepo path.
 
 No versioning mechanism is implemented inside the action itself: a release is a
-Git tag on the dedicated repository, plus a moving `v1` tag pointing at the
-latest `v1.x.x`.
+Git tag on this repository, plus a moving `v1` tag pointing at the latest
+`v1.x.x`.
 
 ## 14. Future migration to a dedicated repository
 
