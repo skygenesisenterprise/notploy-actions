@@ -1,0 +1,64 @@
+name: Notploy Deployment
+description: >-
+  Trigger a Notploy deployment from a GitHub Actions workflow and, optionally,
+  wait for it to finish and fail the job when the deployment fails.
+author: Sky Genesis Enterprise
+
+branding:
+  icon: upload-cloud
+  color: purple
+
+inputs:
+  endpoint:
+    description: >-
+      Base URL of the Notploy instance, for example
+      `https://notploy.example.com`. Do not append `/api`: it is added
+      automatically. Prefer HTTPS.
+    required: true
+  api-key:
+    description: >-
+      Notploy API key, sent as the `x-api-key` header. Store it as a repository
+      or environment secret and reference that secret from the workflow; the
+      value is masked in the logs.
+    required: true
+  application-id:
+    description: Identifier of the Notploy application to deploy.
+    required: true
+  wait:
+    description: >-
+      Wait for the deployment to reach a final state. When `false`, the step
+      returns as soon as the deployment is triggered.
+    required: false
+    default: "true"
+  timeout:
+    description: >-
+      Maximum time to wait for the deployment, as a Go duration (`30m`, `90s`,
+      `1h`). Only used when `wait` is `true`.
+    required: false
+    default: "30m"
+  poll-interval:
+    description: >-
+      Delay between two deployment status lookups, as a Go duration (`5s`,
+      `15s`). Minimum `1s`.
+    required: false
+    default: "5s"
+
+outputs:
+  deployment-id:
+    description: >-
+      Identifier of the triggered Notploy deployment. Empty when the deployment
+      is not visible yet, or when the API key cannot read deployments.
+  deployment-status:
+    description: >-
+      Last observed status of the deployment: `running`, `done`, `error` or
+      `cancelled`, or `triggered` when `wait` is `false`.
+  deployment-url:
+    description: >-
+      Public URL of the application, when it has an enabled domain. Notploy does
+      not expose a per-deployment URL.
+
+runs:
+  # A container action keeps the runtime self-contained: the Go binary is built
+  # during the build of this image, so the runner needs neither Go nor Node.js.
+  using: docker
+  image: Dockerfile

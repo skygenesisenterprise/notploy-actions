@@ -1,0 +1,347 @@
+name: Docker Publish
+
+# Publishes the product container images to the GitHub Container Registry.
+#
+#   GitHub Actions -> Buildx -> GHCR -> cosign (keyless)
+#
+# A push to master rebuilds the catalog and moves `latest`. A tag says what to
+# publish: `v1.2.3` is a full release, `v1.2.3-website` rebuilds the website
+# image alone, and a tag matching no module (`v1.0.0-node`, owned by
+# node-release.yml) leaves the registry alone. A tag always moves `latest` of
+# the image it publishes, a full release moves it for all of them.
+#
+# The seven entries of the publish matrix below are the whole catalog: adding
+# an image means adding it there and to the `image` choices of the
+# workflow_dispatch input. The build context is always the repository root
+# because the whole monorepo is a single pnpm workspace.
+#
+# Pull requests do not run this workflow at all: ci.yml's `docker` job already
+# builds the images (amd64, no push) so a pull request stays fast and this job
+# can hold `packages: write` without ever being reachable from a fork. That is
+# also why the permissions below are granted to the job rather than to the
+# workflow.
+on:
+  push:
+    branches: [master]
+    # Path filters are not evaluated for tag pushes, so a `v*` tag always
+    # reaches the matrix; which images it builds is decided by the tag name
+    # in the "Select image to publish" step.
+    paths:
+      - "Dockerfile"
+      - "apps/notploy/**"
+      - "packages/server/**"
+      - "packages/mcp/**"
+      - "packages/github/**"
+      - "web/**"
+      - "templates/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "package.json"
+      - ".github/workflows/docker-publish.yml"
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      image:
+        # A choice input cannot use "" as an option value, so "all" is the
+        # explicit "build everything" value rather than an empty string.
+        description: "Image to publish (all images when 'all')"
+        type: choice
+        default: all
+        options:
+          - all
+          - notploy
+          - notploy-cloud
+          - notploy-mcp
+          - notploy-github
+          - notploy-website
+          - notploy-docs
+          - notploy-templates
+      push:
+        description: "Push to the registry (off = build only)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # ghcr.io/<owner>/<image>. Override with the IMAGE_PREFIX repository variable
+  # to publish under a different owner (or a mirror on forks).
+  IMAGE_PREFIX: ${{ vars.IMAGE_PREFIX || format('ghcr.io/{0}', github.repository_owner) }}
+
+jobs:
+  publish:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      # Keyless cosign signing mints a short-lived OIDC token to Fulcio; without
+      # this the sign step fails with "no OIDC token found".
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `notploy` is the self-hosted image: on top of the dashboard and the
+          # server it ships the build tooling a customer's deployments need
+          # (Docker daemon, nixpacks, railpack, pack). `notploy-cloud` is the
+          # managed one, the same application without that tooling.
+          - image: notploy
+            file: ./Dockerfile
+            target: selfhosted
+            tag_suffix: "-app"
+            description: Notploy self-hosted (dashboard, server and build tooling)
+          - image: notploy-cloud
+            file: ./Dockerfile
+            target: cloud
+            tag_suffix: "-cloud"
+            description: Notploy Cloud (dashboard + server)
+          - image: notploy-mcp
+            file: ./packages/mcp/Dockerfile
+            tag_suffix: "-mcp"
+            description: Notploy MCP server
+          - image: notploy-github
+            file: ./packages/github/Dockerfile
+            tag_suffix: "-github"
+            description: Notploy GitHub integration
+          - image: notploy-website
+            file: ./web/Dockerfile.website
+            # Next.js currently crashes with SIGILL when its build worker runs
+            # under QEMU for arm64; publish this site image as amd64 only.
+            platforms: linux/amd64
+            tag_suffix: "-website"
+            description: Notploy official website
+          - image: notploy-docs
+            file: ./web/Dockerfile.docs
+            tag_suffix: "-docs"
+            description: Notploy documentation
+          - image: notploy-templates
+            file: ./templates/Dockerfile
+            tag_suffix: "-templates"
+            description: Notploy templates gallery
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # cosign (keyless signing) needs the full tag history to resolve the
+          # commit that an image was built from.
+          fetch-depth: 0
+
+      - name: Select image to publish
+        id: select
+        env:
+          # Read through env so the shell compares plain values instead of
+          # interpolating them into the script body.
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG_NAME: ${{ github.ref_name }}
+          REQUESTED: ${{ inputs.image }}
+          IMAGE: ${{ matrix.image }}
+          TAG_SUFFIX: ${{ matrix.tag_suffix }}
+          DOCKERFILE: ${{ matrix.file }}
+        run: |
+          set -eo pipefail
+
+          # A tag names what to publish: `v1.2.3` releases the catalog,
+          # `v1.2.3-website` rebuilds the website image alone, and a tag
+          # matching no module (`v1.0.0-node`, ...) publishes nothing.
+          catalog=true
+          version=
+          if [ "$REF_TYPE" = "tag" ]; then
+            if [[ "$TAG_NAME" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-(.+))?$ ]]; then
+              version="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+              variant="${BASH_REMATCH[5]:-}"
+            else
+              echo "::warning::tag $TAG_NAME is not a v<major>.<minor>.<patch>[-<module>] release tag, nothing published"
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ -n "$variant" ]; then
+              # A module tag moves the version tags of that module only, so
+              # the catalog-wide ones (1.2.3, 1.2) are left alone.
+              catalog=false
+              if [ "$variant" != "${TAG_SUFFIX#-}" ]; then
+                echo "enabled=false" >> "$GITHUB_OUTPUT"
+                echo "::notice::skipping $IMAGE: tag $TAG_NAME publishes '$variant'"
+                exit 0
+              fi
+            fi
+          fi
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] \
+            && [ "$REQUESTED" != "all" ] \
+            && [ "$REQUESTED" != "$IMAGE" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::skipping $IMAGE: dispatch requested '$REQUESTED'"
+            exit 0
+          fi
+          # An image can be listed before its Dockerfile lands; it is then
+          # reported and left out instead of failing the whole matrix.
+          if [ ! -f "$DOCKERFILE" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::skipping $IMAGE: '$DOCKERFILE' does not exist yet"
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "catalog=$catalog" >> "$GITHUB_OUTPUT"
+          # Handed to metadata-action as the semver `value` so a module tag
+          # resolves to v1.2.3 instead of the v1.2.3-website prerelease.
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Derive tags
+        id: meta
+        if: steps.select.outputs.enabled == 'true'
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
+          tags: |
+            # `value` carries the version stripped of any module suffix, so the
+            # minor alias stays v1.2-website instead of inheriting the
+            # prerelease part metadata-action keeps on {{major}}.{{minor}}.
+            type=semver,pattern={{version}},value=${{ steps.select.outputs.version }},enable=${{ steps.select.outputs.catalog == 'true' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.select.outputs.version }},enable=${{ steps.select.outputs.catalog == 'true' }}
+            type=semver,pattern={{major}}.{{minor}}.{{patch}},prefix=v,suffix=${{ matrix.tag_suffix }}
+            type=semver,pattern={{major}}.{{minor}},prefix=v,suffix=${{ matrix.tag_suffix }}
+            type=sha,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+          flavor: |
+            latest=auto
+          labels: |
+            org.opencontainers.image.title=${{ matrix.image }}
+            org.opencontainers.image.description=${{ matrix.description }}
+            org.opencontainers.image.vendor=skygenesisenterprise
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - uses: docker/setup-buildx-action@v4
+        if: steps.select.outputs.enabled == 'true'
+
+      - name: Log in to ${{ env.IMAGE_PREFIX }}
+        if: steps.select.outputs.enabled == 'true' && (github.event_name != 'workflow_dispatch' || inputs.push)
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.IMAGE_PREFIX }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute push flag
+        id: flags
+        if: steps.select.outputs.enabled == 'true'
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.push }}" != "true" ]; then
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push ${{ matrix.image }}
+        id: build
+        if: steps.select.outputs.enabled == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platforms || 'linux/amd64,linux/arm64' }}
+          push: ${{ steps.flags.outputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          provenance: false
+
+      - name: Install cosign
+        if: steps.select.outputs.enabled == 'true' && steps.flags.outputs.push == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        if: steps.select.outputs.enabled == 'true' && steps.flags.outputs.push == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          # Signing every tag would burn a Fulcio/OIDC certificate per tag; the
+          # digest is what consumers actually pin to, so sign that once.
+          cosign sign --yes \
+            "${{ env.IMAGE_PREFIX }}/${{ matrix.image }}@${DIGEST}"
+
+      - name: Upload image metadata
+        if: steps.select.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-metadata-${{ matrix.image }}
+          path: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ steps.meta.outputs.labels }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Tag a release so `v*` pushes have a matching GitHub Release listing the
+  # published images, and so dependabot/renovate can track them. Only a plain
+  # `v1.2.3` tag releases the catalog: a `v1.2.3-website` module tag publishes
+  # one image, and `v1.0.0-node` belongs to node-release.yml.
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Notploy ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          body: |
+            ## Container images
+
+            Images are published to `${{ env.IMAGE_PREFIX }}` and signed with
+            cosign (keyless, Fulcio/OIDC). All images support
+            `linux/amd64` and `linux/arm64` except `notploy-website`, which is
+            currently published for `linux/amd64` only because the Next.js
+            build worker crashes under QEMU arm64.
+
+            | Image | Description |
+            | --- | --- |
+            | `notploy` | Notploy self-hosted (dashboard, server and build tooling) |
+            | `notploy-cloud` | Notploy Cloud (dashboard + server) |
+            | `notploy-mcp` | Notploy MCP server |
+            | `notploy-github` | Notploy GitHub integration |
+            | `notploy-website` | Notploy official website |
+            | `notploy-docs` | Notploy documentation |
+            | `notploy-templates` | Notploy templates gallery |
+
+            Version tags use the `v<major>.<minor>.<patch><variant>` format,
+            with a minor-version alias. For example, Cloud is published as
+            `notploy-cloud:v1.2.3-cloud` and `notploy-cloud:v1.2-cloud`;
+            MCP, GitHub, website, docs, and templates use `-mcp`, `-github`,
+            `-website`, `-docs`, and `-templates` respectively. A full release
+            also moves the unprefixed `1.2.3` and `1.2` tags of every image.
+
+            Pushing a single module tag such as `v1.2.3-website` rebuilds and
+            pushes that image only.
+
+            ```bash
+            docker pull ${{ env.IMAGE_PREFIX }}/notploy:${{ github.ref_name }}-app
+            ```
+
+            Verify a signature with:
+
+            ```bash
+            cosign verify ${{ env.IMAGE_PREFIX }}/notploy@<digest> \
+              --certificate-identity-regexp 'https://github.com/skygenesisenterprise/notploy/' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            ```

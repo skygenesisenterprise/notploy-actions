@@ -1,0 +1,12 @@
+.git
+.github
+.gitignore
+.dockerignore
+
+# Tests and documentation are not part of the binary.
+*_test.go
+README.md
+
+# Local build output
+/notploy-action
+/dist
